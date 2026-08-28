@@ -164,6 +164,11 @@ export const integrationsSidebar = [
         path: "/how-to-tutorials/tutorials/phone-auth#step-3-integrate-twilio-sms",
         title: "Twilio SMS",
       },
+      {
+        type: "link",
+        path: "/integrations/guides/volanea",
+        title: "Volanea",
+      },
     ],
   },
   {
