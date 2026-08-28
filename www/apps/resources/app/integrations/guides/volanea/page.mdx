@@ -1,0 +1,287 @@
+---
+products:
+  - order
+  - notification
+---
+
+import { Prerequisites, Note, Card } from "docs-ui"
+import { Github } from "@medusajs/icons"
+
+export const metadata = {
+  title: `Integrate Medusa with Volanea (Email Notifications)`,
+}
+
+# {metadata.title}
+
+In this guide, you'll learn how to integrate Medusa with Volanea to send transactional email, such as an order confirmation.
+
+When you install a Medusa application, you get a fully-fledged commerce platform with a Framework for customization. Medusa's architecture supports integrating third-party services, such as an email service, through Module Providers.
+
+[Volanea](https://volanea.com) is an email infrastructure platform for developers. It's built on AWS SES with your own DKIM keys, and it reports per-recipient delivery, bounce, and complaint events back to your application.
+
+Unlike guides that build a provider from scratch, Volanea publishes a Notification Module Provider to npm, so this integration is an install and a few lines of configuration.
+
+This guide will teach you how to:
+
+- Verify a sending domain in Volanea.
+- Install and register the Volanea Notification Module Provider.
+- Send an order confirmation email when a customer places an order.
+
+<Card
+  title="Provider Repository"
+  text="The provider's source, tests, and full option reference."
+  href="https://github.com/Pankaj-bit361/volanea-integrations/tree/main/packages/medusa"
+  icon={Github}
+/>
+
+---
+
+## Step 1: Install a Medusa Application
+
+<Prerequisites items={[
+  {
+    text: "Node.js v20+",
+    link: "https://nodejs.org/en/download"
+  },
+  {
+    text: "PostgreSQL",
+    link: "https://www.postgresql.org/download/"
+  }
+]} />
+
+Start by installing a Medusa application on your machine with the following command:
+
+```bash
+npx create-medusa-app@latest
+```
+
+Refer to the [Medusa installation guide](!docs!/learn/installation) for more details.
+
+---
+
+## Step 2: Prepare your Volanea Account
+
+If you don't have a Volanea account, create one at [volanea.com](https://volanea.com).
+
+### Verify a sending domain
+
+Volanea only sends from domains you own, so this step is required before anything will deliver:
+
+1. Go to **Domains** in the dashboard and click **Add domain**.
+2. Enter the domain you want to send from, such as `yourstore.com`.
+3. Add the DKIM, SPF, and DMARC records it shows you to your DNS provider, exactly as given.
+
+The domain flips to **verified** on its own once the records propagate, usually within about 15 minutes.
+
+<Note title="Important">
+
+Until the domain is verified, every send fails with a `403` error. This is the most common reason a newly installed provider appears broken from the very first order.
+
+</Note>
+
+Two DNS details worth checking:
+
+- A wildcard record such as `*.yourstore.com` shadows the `_domainkey` lookups. Add the DKIM hosts explicitly.
+- A domain may have only one SPF record. If you already have one, merge Volanea's `include:` into it rather than adding a second `TXT` record.
+
+### Get an API key
+
+Go to **Settings → API keys** in the dashboard and copy your secret key.
+
+<Note title="Tip">
+
+Use the test key while you're building. Test-mode sends run through the entire pipeline and are logged in the dashboard, but never reach a real inbox.
+
+</Note>
+
+---
+
+## Step 3: Install the Volanea Provider
+
+In your Medusa application's directory, run:
+
+```bash
+npm install medusa-provider-notification-volanea
+```
+
+The package has no runtime dependencies of its own.
+
+---
+
+## Step 4: Register the Provider
+
+Add the provider to the Notification Module in `medusa-config.ts`:
+
+```ts title="medusa-config.ts"
+module.exports = defineConfig({
+  // ...
+  modules: [
+    {
+      resolve: "@medusajs/medusa/notification",
+      options: {
+        providers: [
+          {
+            resolve: "medusa-provider-notification-volanea",
+            id: "volanea",
+            options: {
+              channels: ["email"],
+              apiKey: process.env.VOLANEA_API_KEY,
+              from: process.env.VOLANEA_FROM,
+              fromName: process.env.VOLANEA_FROM_NAME,
+            },
+          },
+        ],
+      },
+    },
+  ],
+})
+```
+
+Then add the environment variables to `.env`:
+
+```bash
+VOLANEA_API_KEY=sk_...
+VOLANEA_FROM=orders@yourstore.com
+VOLANEA_FROM_NAME=Your Store
+```
+
+`from` must be an address on the domain you verified in step 2.
+
+<Note>
+
+Only one provider can serve a channel, so this replaces any provider previously registered for `email`.
+
+</Note>
+
+The provider validates its options while Medusa boots. If a required option is missing, the application fails to start with an error naming it, rather than failing silently at the first order.
+
+### Provider Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `apiKey` | - | Required. Your Volanea secret key. |
+| `from` | - | Default sender address. Must be on a verified domain. |
+| `fromName` | - | Default sender display name. |
+| `replyTo` | - | Default `Reply-To` address. |
+| `baseUrl` | `https://api.volanea.com` | Override the API host. |
+| `timeout` | `15000` | Abort the request after this many milliseconds. |
+| `throwOnSkip` | `true` | Throw when every recipient was skipped. See step 6. |
+
+Each option is also accepted in snake_case (`api_key`, `from_name`, and so on) to match the convention used by Medusa's first-party providers.
+
+---
+
+## Step 5: Send an Email when an Order is Placed
+
+Create a subscriber at `src/subscribers/order-placed.ts` that sends an email using the Notification Module:
+
+```ts title="src/subscribers/order-placed.ts"
+import type { SubscriberArgs, SubscriberConfig } from "@medusajs/framework"
+import { Modules } from "@medusajs/framework/utils"
+
+export default async function orderPlacedHandler({
+  event: { data },
+  container,
+}: SubscriberArgs<{ id: string }>) {
+  const notificationModuleService = container.resolve(Modules.NOTIFICATION)
+  const orderModuleService = container.resolve(Modules.ORDER)
+
+  const order = await orderModuleService.retrieveOrder(data.id, {
+    relations: ["items"],
+  })
+
+  await notificationModuleService.createNotifications({
+    to: order.email,
+    channel: "email",
+    template: "tpl_order_placed",
+    data: {
+      order: {
+        id: order.id,
+        display_id: order.display_id,
+        total: order.total,
+      },
+      items: order.items,
+    },
+  })
+}
+
+export const config: SubscriberConfig = {
+  event: "order.placed",
+}
+```
+
+`template` is the ID of a template you create in the Volanea dashboard. To send inline content instead, pass an empty `template` and a `content` object with `subject`, `html`, and `text`.
+
+### How `data` is Passed to the Template
+
+Volanea accepts template variables as a flat map of strings, numbers, and booleans. Since Medusa's `data` is usually nested, the provider flattens it to dotted keys:
+
+```ts
+{ order: { id: "order_01", total: 4900 }, items: [{ title: "Mug" }] }
+// is sent as
+{
+  "order.id": "order_01",
+  "order.total": 4900,
+  "items.length": 1,
+  "items.0.title": "Mug"
+}
+```
+
+Write your template placeholders the way the nested data reads, such as `{{order.id}}`, and they resolve against the flattened keys.
+
+---
+
+## Step 6: Two Behaviors to Account For
+
+Email delivery is asynchronous, and two aspects of that are worth designing around.
+
+### A Successful Response Doesn't Mean Delivered
+
+The API responds as soon as the message is durably queued. The provider reports that a message was *accepted*, never that it was *delivered*.
+
+To act on the real outcome, register a webhook in the Volanea dashboard for the `email.delivered`, `email.bounced`, and `email.complained` events. The provider returns Volanea's message ID, so you can correlate an event with the notification that produced it.
+
+### A Successful Response Can Mean Nothing Was Sent
+
+Volanea reports per-recipient skips - a suppressed address, an unsubscribed contact, an exceeded quota - inside a successful response.
+
+Medusa treats a resolved promise as a successful send, so a fully skipped send would otherwise pass silently: the notification is recorded, but the customer never receives their order confirmation.
+
+For that reason, the provider throws when every recipient was skipped. Set `throwOnSkip: false` if you'd rather the send resolve and handle the skips from your logs.
+
+---
+
+## Test it Out: Place an Order
+
+Start the Medusa application:
+
+```bash
+npm run dev
+```
+
+Place an order through your storefront, or use the [Store API](!api!/store) directly. The message appears under **Emails** in the Volanea dashboard within a second or two, along with its delivery status.
+
+<Note title="Tip">
+
+When testing, send to `success@simulator.amazonses.com`. The SES mailbox simulator absorbs the message: it never bounces and never counts against your quota or sender reputation. Avoid inventing a test address on a real domain, as it hard-bounces and hard bounces harm your sender reputation.
+
+</Note>
+
+### Troubleshooting
+
+- **Every send returns a 403**: the `from` domain isn't verified. Check **Domains** in the dashboard.
+- **Emails send in development but not production**: you're likely using a test-mode key. The provider logs a warning on every test-mode send.
+- **Medusa boots but the provider is never used**: another provider is registered for the `email` channel. Only one provider can serve a channel.
+- **Nothing arrives and no error is thrown**: you have `throwOnSkip: false` and the recipients were skipped. Check the logs, then **Suppressions** in the dashboard.
+
+---
+
+## Next Steps
+
+### More Provider Options
+
+The provider supports attachments, idempotency keys, custom headers, and scheduled sends through `provider_data`. Refer to the [full documentation](https://volanea.com/docs/integrations/medusa) for the complete reference.
+
+### Learn More About Medusa
+
+To learn more about Medusa's Notification Module and how to send notifications in other flows, refer to the [Notification Module documentation](/infrastructure-modules/notification).
